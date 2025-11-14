@@ -3,14 +3,14 @@ import pandas as pd
 
 st.set_page_config(page_title="STAT APP", layout="wide")
 
-st.title("STAT APP - Test Funzionante")
+st.title("STAT APP - Test Senza Upload")
 
-uploaded = st.file_uploader("Carica un file Excel", type=["xlsx"])
+# Carica un file fisso locale
+FILE_NAME = "data.xlsx"
 
-if uploaded:
-    try:
-        df = pd.read_excel(uploaded)
-        st.write("File caricato correttamente:")
-        st.dataframe(df)
-    except Exception as e:
-        st.error(f"Errore nel leggere il file: {e}")
+try:
+    df = pd.read_excel(FILE_NAME)
+    st.success(f"File '{FILE_NAME}' caricato correttamente.")
+    st.dataframe(df)
+except Exception as e:
+    st.error(f"Errore nel leggere il file '{FILE_NAME}': {e}")
