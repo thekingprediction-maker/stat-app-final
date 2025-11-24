@@ -1,40 +1,378 @@
-<!DOCTYPE html>
-<html lang="it">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="theme-color" content="#0f172a">
-    <title>BetAnalyst Pro v11.1</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
-    <style>
-        :root { --bg-dark: #0b1120; --card: #1e293b; --accent: #10b981; }
-        body { 
-            background-color: var(--bg-dark); color: #f8fafc; 
-            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-            -webkit-tap-highlight-color: transparent;
-        }
-        .input-dark { background-color: #0f172a; border: 1px solid #334155; color: white; }
-        
-        /* Advanced Badge Style */
-        .badge-edge { background: linear-gradient(45deg, #064e3b, #10b981); border: 1px solid #34d399; color: white; }
-        
-        /* Grid Animation */
-        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        .result-card { animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+# app.py — STAT APP robusta (auto-detect fogli) 
+# Requisiti: streamlit pandas numpy scipy openpyxl
+import streamlit as st
+import pandas as pd
+import numpy as np
+import math
+import os
+from statistics import mean
+from scipy.stats import norm, poisson
 
-        .tab-btn.active { border-bottom: 2px solid #10b981; color: #10b981; background: rgba(16, 185, 129, 0.1); }
-        
-        .odds-box { background-color: #1e293b; border: 1px solid #334155; border-radius: 6px; transition: transform 0.1s; }
-        .odds-box:active { transform: scale(0.96); }
-        .odds-box.value-bet { background-color: #064e3b; border-color: #34d399; box-shadow: 0 0 12px rgba(52, 211, 153, 0.25); }
-        .odds-box.value-bet .prob-text { color: #34d399; font-weight: 800; }
-    </style>
-</head>
-<body class="pb-24 safe-area-pb">
+st.set_page_config(page_title="STAT APP — Pronostici Tiri & Falli", layout="wide")
+st.markdown("<h1 style='color:#0b57a4;'>⚽ STAT APP — Pronostici Tiri & Falli</h1>", unsafe_allow_html=True)
+st.write("Engine: EWMA + shrinkage + Poisson/Normal mixture · selezione arbitro per falli · backtest integrato")
 
-    <!-- Navbar -->
+# -----------------------------
+# Cerca automaticamente un file Excel nella root del repo
+# Se preferisci un nome fisso, metti qui 'data_all.xlsx' o il nome che vuoi
+POSSIBLE_FILES = ["dati tiri e falli serie a e liga.xlsx", "data_all.xlsx", "mega_file.xlsx",
+                  "tiri_serie_a.xlsx","falli_serie_a.xlsx","falli_liga.xlsx"]
+
+def find_excel():
+    # cerca file nell'area di lavoro /app o /workspace oppure /mnt/data
+    search_paths = [".", "/workspace", "/app", "/mnt/data"]
+    for p in search_paths:
+        try:
+            for fname in os.listdir(p):
+                lower = fname.lower()
+                if lower.endswith(".xlsx") or lower.endswith(".xls"):
+                    # preferisci nomi in POSSIBLE_FILES
+                    if fname in POSSIBLE_FILES:
+                        return os.path.join(p, fname)
+            # se non trovi preferisci, prendi il primo excel trovato
+            for fname in os.listdir(p):
+                lower = fname.lower()
+                if lower.endswith(".xlsx") or lower.endswith(".xls"):
+                    return os.path.join(p, fname)
+        except Exception:
+            continue
+    return None
+
+EXCEL_PATH = find_excel()
+if EXCEL_PATH is None:
+    st.error("Nessun file Excel trovato nella root. Carica qui il file unico con tutti i dati o i tre file separati.")
+    st.stop()
+
+st.info(f"Uso file: {os.path.basename(EXCEL_PATH)}")
+
+# -----------------------------
+# Carica tutte le sheet e cerca i fogli utili
+# -----------------------------
+@st.cache_data(ttl=600)
+def load_all_sheets(path):
+    try:
+        x = pd.read_excel(path, sheet_name=None)
+        return x
+    except Exception as e:
+        return None
+
+sheets = load_all_sheets(EXCEL_PATH)
+if sheets is None:
+    st.error("Errore leggendo il file Excel. Controlla che non sia protetto e che sia .xlsx.")
+    st.stop()
+
+# funzione helper per trovare foglio con parola chiave
+def sheet_by_keyword(keywords):
+    for name, df in sheets.items():
+        lname = name.lower()
+        for kw in keywords:
+            if kw in lname:
+                return name, df
+    # fallback: try to find by column names
+    for name, df in sheets.items():
+        cols = " ".join([c.lower() for c in df.columns])
+        for kw in keywords:
+            if kw in cols:
+                return name, df
+    return None, None
+
+# identifica fogli
+tiri_sheet_name, df_tiri = sheet_by_keyword(["tiri", "shots", "shots_on", "shoot"])
+falli_ita_sheet_name, df_falli_ita = sheet_by_keyword(["falli", "fouls", "arbitro", "referee", "serie a", "serie_a"])
+falli_liga_sheet_name, df_falli_liga = sheet_by_keyword(["liga", "spagna", "spain", "laliga", "la liga", "falli_liga"])
+
+# se non trovati, prova a prendere altri fogli in ordine
+if df_tiri is None:
+    # try first sheet that contains numeric columns
+    for name, df in sheets.items():
+        if df.shape[1] >= 3:
+            df_tiri = df; tiri_sheet_name = name; break
+if df_falli_ita is None:
+    for name, df in sheets.items():
+        if "arbitro" in " ".join([c.lower() for c in df.columns]) or "referee" in " ".join([c.lower() for c in df.columns]):
+            df_falli_ita = df; falli_ita_sheet_name = name; break
+if df_falli_liga is None:
+    # try any sheet with 'liga' or 'spain' in name
+    for name, df in sheets.items():
+        if 'liga' in name.lower() or 'spain' in name.lower() or 'la liga' in name.lower():
+            df_falli_liga = df; falli_liga_sheet_name = name; break
+
+# show mapping summary
+st.sidebar.header("File & sheet trovati")
+st.sidebar.write("Excel:", os.path.basename(EXCEL_PATH))
+st.sidebar.write("Tiri sheet:", tiri_sheet_name)
+st.sidebar.write("Falli SA sheet:", falli_ita_sheet_name)
+st.sidebar.write("Falli Liga sheet:", falli_liga_sheet_name)
+
+# -----------------------------
+# mapping colonne tollerante
+# -----------------------------
+def find_col(df, candidates):
+    if df is None: return None
+    cols = list(df.columns)
+    low = {c.lower(): c for c in cols}
+    for cand in candidates:
+        if cand.lower() in low:
+            return low[cand.lower()]
+    for cand in candidates:
+        k = cand.lower()
+        for c in cols:
+            if k in c.lower():
+                return c
+    return None
+
+# TIRI
+tiri_team_col = find_col(df_tiri, ["squadra","team","team name"]) if df_tiri is not None else None
+tiri_home_col = find_col(df_tiri, ["home team","squadra_casa","home"]) if df_tiri is not None else None
+tiri_away_col = find_col(df_tiri, ["away team","squadra_ospite","away"]) if df_tiri is not None else None
+tiri_tot_col = find_col(df_tiri, ["tiri_tot","tiri totali","total shots","shots"]) if df_tiri is not None else None
+tiri_sot_col = find_col(df_tiri, ["tiri in porta","shots on target","sot","shots_on_target"]) if df_tiri is not None else None
+
+# FALLI ITA
+falli_ita_team_col = find_col(df_falli_ita, ["squadra","team"]) if df_falli_ita is not None else None
+falli_ita_falli_col = find_col(df_falli_ita, ["falli","fouls","falli_commessi"]) if df_falli_ita is not None else None
+falli_ita_arb_col = find_col(df_falli_ita, ["arbitro","referee","official"]) if df_falli_ita is not None else None
+falli_ita_arb_mean_col = find_col(df_falli_ita, ["media_arbitro","avg_ref","ref_avg"]) if df_falli_ita is not None else None
+
+# FALLI LIGA
+falli_liga_team_col = find_col(df_falli_liga, ["squadra","team"]) if df_falli_liga is not None else None
+falli_liga_falli_col = find_col(df_falli_liga, ["falli","fouls"]) if df_falli_liga is not None else None
+
+# -----------------------------
+# Build histories
+# -----------------------------
+team_stats = {}
+arbitri_stats = {}
+
+def add_team_val(team, key, val):
+    if team is None or pd.isna(team): return
+    t = str(team).strip()
+    if t == "": return
+    team_stats.setdefault(t, {}).setdefault(key, []).append(safe_float(val))
+
+# populate from tiri sheet (aggregated or match-level)
+if df_tiri is not None:
+    if tiri_team_col and tiri_team_col in df_tiri.columns and tiri_tot_col and tiri_tot_col in df_tiri.columns:
+        # aggregated per-team
+        for _, r in df_tiri.iterrows():
+            team = r.get(tiri_team_col)
+            if pd.isna(team): continue
+            add_team_val(team, 'tiri', r.get(tiri_tot_col))
+            if tiri_sot_col and tiri_sot_col in df_tiri.columns:
+                add_team_val(team, 'sot', r.get(tiri_sot_col))
+    else:
+        # try match-level: detect home/away shot columns
+        for _, r in df_tiri.iterrows():
+            home = r.get(tiri_home_col) if tiri_home_col in df_tiri.columns else None
+            away = r.get(tiri_away_col) if tiri_away_col in df_tiri.columns else None
+            home_sh = None; away_sh = None
+            for c in df_tiri.columns:
+                cl = c.lower()
+                if "home" in cl and ("shot" in cl or "tiri" in cl):
+                    home_sh = r.get(c)
+                if "away" in cl and ("shot" in cl or "tiri" in cl):
+                    away_sh = r.get(c)
+            if home and not pd.isna(home):
+                add_team_val(home, 'tiri', home_sh)
+            if away and not pd.isna(away):
+                add_team_val(away, 'tiri', away_sh)
+
+# falli serie a
+if df_falli_ita is not None:
+    for _, r in df_falli_ita.iterrows():
+        team = r.get(falli_ita_team_col) if falli_ita_team_col in df_falli_ita.columns else None
+        if team is not None and not pd.isna(team):
+            if falli_ita_falli_col and falli_ita_falli_col in df_falli_ita.columns:
+                add_team_val(team, 'falli', r.get(falli_ita_falli_col))
+        # arbitri stats
+        if falli_ita_arb_col and falli_ita_arb_col in df_falli_ita.columns:
+            arb = r.get(falli_ita_arb_col)
+            if pd.notna(arb):
+                name = str(arb).strip()
+                if falli_ita_arb_mean_col and (falli_ita_arb_mean_col in df_falli_ita.columns):
+                    val = safe_float(r.get(falli_ita_arb_mean_col))
+                elif falli_ita_falli_col and (falli_ita_falli_col in df_falli_ita.columns):
+                    val = safe_float(r.get(falli_ita_falli_col))
+                else:
+                    val = 0.0
+                arbitri_stats.setdefault(name, []).append(val)
+
+# falli liga
+if df_falli_liga is not None:
+    for _, r in df_falli_liga.iterrows():
+        team = r.get(falli_liga_team_col) if falli_liga_team_col and (falli_liga_team_col in df_falli_liga.columns) else None
+        if team is not None and not pd.isna(team):
+            if falli_liga_falli_col and (falli_liga_falli_col in df_falli_liga.columns):
+                add_team_val(team, 'falli_liga', r.get(falli_liga_falli_col))
+
+# -----------------------------
+# MODEL helpers
+# -----------------------------
+def ewma(vals, span=6):
+    arr = [safe_float(v) for v in vals if v is not None and not pd.isna(v)]
+    if len(arr)==0: return 0.0
+    s = pd.Series(arr)
+    return float(s.ewm(span=span, adjust=False).mean().iloc[-1])
+
+def shrink_est(est, prior, n, alpha=10.0):
+    if n<=0: return prior
+    w = n/(n+alpha)
+    return w*est + (1-w)*prior
+
+def pstdev(vals):
+    try:
+        arr = [safe_float(v) for v in vals if v is not None and not pd.isna(v)]
+        return float(pd.Series(arr).std(ddof=0)) if len(arr)>0 else 0.0
+    except:
+        return 0.0
+
+def p_over_mix(mu, sigma, thresh, w_pois=0.6):
+    k = math.floor(thresh)
+    mu_pos = max(mu, 0.0)
+    try:
+        p_p = 1.0 - poisson.cdf(k, mu_pos)
+    except:
+        p_p = 0.0
+    try:
+        p_n = 1.0 - norm.cdf(thresh + 0.5, loc=mu, scale=max(sigma,0.1))
+    except:
+        p_n = 0.0
+    return float(min(1.0, max(0.0, w_pois*p_p + (1-w_pois)*p_n)))
+
+# -----------------------------
+# Sidebar params
+# -----------------------------
+st.sidebar.header("Parametri modello")
+span = st.sidebar.slider("Span EWMA", 3, 12, value=6)
+alpha = st.sidebar.slider("Shrink α", 1.0, 30.0, value=10.0)
+w_p = st.sidebar.slider("Peso Poisson (mixture)", 0.0, 1.0, 0.6)
+spreads = st.sidebar.multiselect("Linee (spread) da valutare", [8.5,9.5,10.5,11.5,12.5,13.5,14.5], default=[9.5,10.5,11.5,12.5])
+st.sidebar.write("Arbitri rilevati (Serie A):", sorted(list(arbitri_stats.keys()))[:30])
+
+# -----------------------------
+# Main UI: menu con tre sezioni
+# -----------------------------
+st.markdown("### Seleziona sezione")
+section = st.selectbox("Sezione", ["Tiri Serie A", "Falli Serie A", "Falli Liga", "Backtest"])
+
+def compute_expect(home, away, key):
+    h_vals = team_stats.get(home, {}).get(key, [])
+    a_vals = team_stats.get(away, {}).get(key, [])
+    mu_h_recent = ewma(h_vals, span=span) if len(h_vals)>0 else 0.0
+    mu_a_recent = ewma(a_vals, span=span) if len(a_vals)>0 else 0.0
+    mu_h_overall = mean(h_vals) if len(h_vals)>0 else 0.0
+    mu_a_overall = mean(a_vals) if len(a_vals)>0 else 0.0
+    mu_h = shrink_est(0.7*mu_h_recent + 0.3*mu_h_overall, mu_h_overall, len(h_vals), alpha)
+    mu_a = shrink_est(0.7*mu_a_recent + 0.3*mu_a_overall, mu_a_overall, len(a_vals), alpha)
+    mu_tot = mu_h + mu_a
+    sigma_h = max(0.6, pstdev(h_vals) if len(h_vals)>1 else max(0.6, mu_h*0.25))
+    sigma_a = max(0.6, pstdev(a_vals) if len(a_vals)>1 else max(0.6, mu_a*0.25))
+    sigma_tot = math.sqrt(sigma_h**2 + sigma_a**2)
+    return mu_h, mu_a, mu_tot, sigma_tot
+
+# teams list build
+teams = sorted(list(team_stats.keys()))
+if len(teams)==0:
+    st.error("Nessuna squadra trovata nei dati. Controlla il file Excel e le intestazioni.")
+    st.stop()
+
+# UI per sezione
+if section == "Tiri Serie A":
+    st.header("Tiri — Serie A")
+    home = st.selectbox("Casa", teams)
+    away = st.selectbox("Ospite", [t for t in teams if t!=home] or teams)
+    if home and away:
+        mu_h, mu_a, mu, sigma = compute_expect(home, away, 'tiri')
+        st.write(f"Atteso tiri totali: {mu:.2f} (home {mu_h:.2f} | away {mu_a:.2f}) — sigma {sigma:.2f}")
+        rows = []
+        for L in sorted(spreads):
+            p = p_over_mix(mu, sigma, L, w_p)
+            rows.append({"line": L, "p_over": round(p,3), "p_under": round(1-p,3)})
+        st.table(pd.DataFrame(rows))
+elif section == "Falli Serie A":
+    st.header("Falli — Serie A")
+    home = st.selectbox("Casa", teams, key="home_fa")
+    away = st.selectbox("Ospite", [t for t in teams if t!=home] or teams, key="away_fa")
+    arb_list = ["(nessuno)"] + sorted(list(arbitri_stats.keys()))
+    arb = st.selectbox("Arbitro (opzionale)", arb_list)
+    if home and away:
+        mu_h, mu_a, mu, sigma = compute_expect(home, away, 'falli')
+        arb_note = ""
+        if arb and arb != "(nessuno)" and arb in arbitri_stats:
+            arb_mean = mean(arbitri_stats[arb])
+            adj = (arb_mean - (mu/2.0)) * 0.5
+            mu = mu + adj
+            arb_note = f"(arb adj {adj:.2f}, arb_mean {arb_mean:.2f})"
+        st.write(f"Atteso falli totali: {mu:.2f} {arb_note} — sigma {sigma:.2f}")
+        rows = []
+        for L in sorted(spreads):
+            p = p_over_mix(mu, sigma, L, w_p)
+            rows.append({"line": L, "p_over": round(p,3), "p_under": round(1-p,3)})
+        st.table(pd.DataFrame(rows))
+elif section == "Falli Liga":
+    st.header("Falli — Liga (Spagna)")
+    # use same team list but may be empty for liga-specific teams
+    home = st.selectbox("Casa (Liga)", teams, key="home_l")
+    away = st.selectbox("Ospite (Liga)", [t for t in teams if t!=home] or teams, key="away_l")
+    if home and away:
+        mu_h, mu_a, mu, sigma = compute_expect(home, away, 'falli_liga')
+        st.write(f"Atteso falli totali (Liga): {mu:.2f} — sigma {sigma:.2f}")
+        rows = []
+        for L in sorted(spreads):
+            p = p_over_mix(mu, sigma, L, w_p)
+            rows.append({"line": L, "p_over": round(p,3), "p_under": round(1-p,3)})
+        st.table(pd.DataFrame(rows))
+else:
+    st.header("Backtest & Accuracy")
+    st.write("Esegui backtest solo se i fogli contengono righe match-by-match (colonne Home/Away + valori).")
+    can_backtest = False
+    # try detect match-level tiri
+    if df_tiri is not None and (tiri_home_col in df_tiri.columns and tiri_away_col in df_tiri.columns):
+        can_backtest = True
+    if not can_backtest:
+        st.info("Non trovo colonne Home/Away chiare in foglio tiri — backtest non possibile con i dati attuali.")
+    else:
+        st.write("Eseguo backtest tiri usando colonne Home/Away e valori match-level.")
+        # detect home/away shot columns
+        home_sh_col = None; away_sh_col = None
+        for c in df_tiri.columns:
+            cl = c.lower()
+            if "home" in cl and ("shot" in cl or "tiri" in cl): home_sh_col = c
+            if "away" in cl and ("shot" in cl or "tiri" in cl): away_sh_col = c
+        if home_sh_col is None or away_sh_col is None:
+            st.info("Non trovo chiaramente le colonne home/away shots per backtest.")
+        else:
+            st.write(f"Uso colonne: {home_sh_col} | {away_sh_col}")
+            thr = st.number_input("Soglia backtest (es. 22.5)", value=22.5, step=0.5)
+            window = st.slider("Span EWMA backtest", 3, 12, 6)
+            df_hist = df_tiri.copy().reset_index(drop=True)
+            preds=[]; actuals=[]
+            hist = {}
+            for idx, r in df_hist.iterrows():
+                ht = r.get(tiri_home_col); at = r.get(tiri_away_col)
+                if pd.isna(ht) or pd.isna(at):
+                    preds.append(None); actuals.append(None); continue
+                ht = str(ht).strip(); at = str(at).strip()
+                hvals = hist.get(ht, []); avals = hist.get(at, [])
+                mu_h = ewma(hvals, span=window) if len(hvals)>0 else (mean(hvals) if len(hvals)>0 else 0.0)
+                mu_a = ewma(avals, span=window) if len(avals)>0 else (mean(avals) if len(avals)>0 else 0.0)
+                mu_pred = mu_h + mu_a
+                p = p_over_mix(mu_pred, max(0.8, math.sqrt((np.std(hvals) if len(hvals)>1 else mu_h*0.25)**2 + (np.std(avals) if len(avals)>1 else mu_a*0.25)**2)), thr, w_p)
+                preds.append(p)
+                real_h = safe_float(r.get(home_sh_col)); real_a = safe_float(r.get(away_sh_col))
+                actuals.append(1 if (real_h + real_a) > thr else 0)
+                hist.setdefault(ht, []).append(real_h); hist.setdefault(at, []).append(real_a)
+            df_bt = pd.DataFrame({"pred":preds,"actual":actuals}).dropna()
+            if df_bt.empty:
+                st.info("Backtest non ha righe utili.")
+            else:
+                cutoff = st.slider("Soglia probabilità per segnale OVER", 0.5, 0.9, 0.58)
+                df_bt['pred_over'] = df_bt['pred'] >= cutoff
+                acc = (df_bt['pred_over'] == df_bt['actual']).mean()
+                st.metric("Accuracy backtest", f"{acc*100:.2f}%")
+                st.dataframe(df_bt.head(300))
+
+st.markdown("<small>Nota: il raggiungimento del 75% dipende dai dati. Questo motore fornisce gli strumenti per testare, calibrare e migliorare il modello tramite backtest e ottimizzazione.</small>", unsafe_allow_html=True)    <!-- Navbar -->
     <nav class="bg-slate-900/95 backdrop-blur border-b border-slate-800 p-4 sticky top-0 z-50 flex justify-between items-center pt-safe-top shadow-2xl">
         <div class="flex items-center gap-3">
             <div class="bg-green-500/20 p-2 rounded-lg border border-green-500/30">
