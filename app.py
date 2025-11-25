@@ -51,7 +51,7 @@ st.info(f"Uso file: {os.path.basename(EXCEL_PATH)}")
 @st.cache_data(ttl=600)
 def load_all_sheets(path):
     try:
-        x = pd.read_excel(path, sheet_name=None)
+x = pd.read_excel(path, sheet_name=None)
         return x
     except Exception as e:
         return None
